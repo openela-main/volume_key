@@ -1,7 +1,7 @@
 Summary: An utility for manipulating storage encryption keys and passphrases
 Name: volume_key
 Version: 0.3.11
-Release: 5%{?dist}
+Release: 6%{?dist}
 # lib/{SECerrs,SSLerrs}.h are both licensed under MPLv1.1, GPLv2 and LGPLv2
 License: GPLv2 and (MPLv1.1 or GPLv2 or LGPLv2)
 Group: Applications/System
@@ -12,6 +12,11 @@ Source0: https://releases.pagure.org/volume_key/volume_key-%{version}.tar.xz
 # Add support for opening all types of LUKS devices (not just LUKS1)
 # Resolves: rhbz#1626974
 Patch0: volume_key-0.3.11-support_LUKS_all.patch
+# Make volume_key working in FIPS mode
+# Resolves: rhbz#2143223
+Patch1: volume_key-0.3.11-FIPS.patch
+# Diagnose patch to get more insight on whats wrong
+Patch2: volume_key-0.3.11-show_get_password_error.patch
 BuildRequires: cryptsetup-luks-devel, gettext-devel, glib2-devel, /usr/bin/gpg2
 BuildRequires: gpgme-devel, libblkid-devel, nss-devel, python3-devel
 # Needed by %%check:
@@ -80,6 +85,8 @@ for other formats is possible, some formats are planned for future releases.
 %prep
 %setup -q
 %patch0 -p1
+%patch1 -p1
+%patch2 -p1
 
 %build
 %configure
@@ -128,6 +135,10 @@ rm -rf $RPM_BUILD_ROOT
 %{python3_sitearch}/__pycache__/volume_key.*
 
 %changelog
+* Fri Jul 21 2023 Jiri Kucera <jkucera@redhat.com> - 0.3.11-6
+- Make volume_key working in FIPS mode
+  Resolves: #2143223
+
 * Wed Aug 14 2019 Jiri Kucera <jkucera@redhat.com> - 0.3.11-5
 - Place %%find_lang to proper place
   Resolves: #1665135
