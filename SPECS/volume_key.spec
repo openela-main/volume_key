@@ -32,7 +32,7 @@
 Summary: An utility for manipulating storage encryption keys and passphrases
 Name: volume_key
 Version: 0.3.12
-Release: 15%{?dist}
+Release: 16%{?dist}
 License: GPLv2
 URL: https://pagure.io/%{name}/
 Requires: %{name}-libs%{?_isa} = %{version}-%{release}
@@ -44,6 +44,7 @@ Patch0: volume_key-0.3.12-support_LUKS2_and_more.patch
 # Fix resource leaks
 # - backport of bf6618ec0b09b4e51fc97fa021e687fbd87599ba
 Patch1: volume_key-0.3.12-fix_resource_leaks.patch
+Patch2:  volume_key-0.3.12-FIPS.patch
 BuildRequires: make
 BuildRequires: gcc
 BuildRequires: cryptsetup-devel, gettext-devel, glib2-devel, /usr/bin/gpg2
@@ -118,8 +119,9 @@ Requires: %{name}-libs%{?_isa} = %{version}-%{release}
 
 %prep
 %setup -q
-%patch0 -p1
-%patch1 -p1
+%patch -P 0 -p1
+%patch -P 1 -p1
+%patch -P 2 -p1 -b .FIPS
 
 %build
 %configure %{?with_pythons}
@@ -170,6 +172,9 @@ exit 1; \
 %endif
 
 %changelog
+* Thu Feb 06 2025 Michal Hlavinka <mhlavink@redhat.com> - 0.3.12-16
+- make volume_key FIPS compliant (RHEL-78044)
+
 * Thu Aug 26 2021 Jiri Kucera <jkucera@redhat.com> - 0.3.12-15
 - Fix FTBFS
   Related: #1986584
