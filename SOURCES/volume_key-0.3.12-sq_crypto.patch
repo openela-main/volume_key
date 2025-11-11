@@ -1,0 +1,1206 @@
+diff -up volume_key-0.3.12/configure.ac.sq_crypto volume_key-0.3.12/configure.ac
+--- volume_key-0.3.12/configure.ac.sq_crypto	2018-10-08 13:24:58.000000000 +0200
++++ volume_key-0.3.12/configure.ac	2025-07-23 14:10:46.558515947 +0200
+@@ -195,7 +195,13 @@ AC_DEFINE(G_DISABLE_DEPRECATED, 1,
+ PKG_CHECK_MODULES(libcryptsetup, [libcryptsetup])
+ PKG_CHECK_MODULES(nss, [nss])
+ 
+-AM_PATH_GPGME
++AM_CHECK_SQ([external])
++AM_CONDITIONAL([WITH_SQ], [test x$SQ_PATH != x])
++
++# Check for GPGME only if --with-sq was not specified
++AS_IF([test "x$SQ_PATH" = "x"],
++      [m4_ifdef([AM_PATH_GPGME],[AM_PATH_GPGME],[AC_MSG_ERROR([Not using sq yet GPGME is missing as well])])],
++      [AC_MSG_NOTICE([Skipping GPGME check, using sq instead])])
+ 
+ AM_GNU_GETTEXT([external])
+ AM_GNU_GETTEXT_VERSION([0.18.2])
+diff -up volume_key-0.3.12/lib/crypto.c.sq_crypto volume_key-0.3.12/lib/crypto.c
+--- volume_key-0.3.12/lib/crypto.c.sq_crypto	2025-07-23 13:35:56.130945870 +0200
++++ volume_key-0.3.12/lib/crypto.c	2025-07-23 13:35:56.132432928 +0200
+@@ -26,7 +26,6 @@ Author: Miloslav Trmač <mitr@redhat.com
+ #include <cms.h>
+ #include <glib.h>
+ #include <glib/gi18n-lib.h>
+-#include <gpgme.h>
+ #include <keyhi.h>
+ #include <nss.h>
+ #include <pk11pub.h>
+@@ -34,6 +33,11 @@ Author: Miloslav Trmač <mitr@redhat.com
+ #include <prinit.h>
+ #include <smime.h>
+ 
++#if WITH_SQ
++# include "crypto-sq.h"
++#else
++# include "crypto-gpgme.h"
++#endif
+ #include "crypto.h"
+ #include "nss_error.h"
+ #include "libvolume_key.h"
+@@ -682,219 +686,3 @@ unwrap_symmetric (size_t *clear_secret_s
+  err:
+   return NULL;
+ }
+-
+- /* libgpgme utils */
+-
+-static void
+-error_from_gpgme (GError **error, gpgme_error_t e)
+-{
+-  size_t len;
+-  char *s;
+-
+-  s = NULL;
+-  len = 100;
+-  for (;;)
+-    {
+-      s = g_realloc (s, len);
+-      if (gpgme_strerror_r (e, s, len) == 0)
+-	break;
+-      len *= 2;
+-    }
+-  g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO, _("%s: %s"),
+-	       gpgme_strsource (e), s);
+-  g_free (s);
+-}
+-
+-static gpgme_error_t
+-gpgme_passphrase_cb (void *hook, const char *uid_hint,
+-		     const char *passphrase_info, int prev_was_bad, int fd)
+-{
+-  static const char nl = '\n';
+-
+-  const char *pw;
+-  size_t len;
+-  ssize_t res;
+-
+-  (void)uid_hint;
+-  (void)passphrase_info;
+-  if (prev_was_bad != 0)
+-    return GPG_ERR_CANCELED;
+-  pw = hook;
+-  len = strlen (pw);
+-  while (len != 0)
+-    {
+-      res = write (fd, pw, len);
+-      if (res < 0)
+-	return gpgme_error_from_errno (errno);
+-      pw += res;
+-      len -= res;
+-    }
+-  if (write (fd, &nl, sizeof (nl)) < 0)
+-    return gpgme_error_from_errno (errno);
+-  return 0;
+-}
+-
+-/* Create and configure a gpgme context, to use PASSPHRASE.
+-   Return 0 if OK, -1 on error. */
+-static int
+-init_gpgme (gpgme_ctx_t *res, const char *passphrase, GError **error)
+-{
+-  gpgme_ctx_t ctx;
+-  gpgme_error_t e;
+-
+-  (void)gpgme_check_version (NULL);
+-  e = gpgme_new (&ctx);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err;
+-    }
+-  e = gpgme_set_locale (ctx, LC_CTYPE, setlocale (LC_CTYPE, NULL));
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_ctx;
+-    }
+-  e = gpgme_set_locale (ctx, LC_MESSAGES, setlocale (LC_MESSAGES, NULL));
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_ctx;
+-    }
+-  e = gpgme_set_protocol (ctx, GPGME_PROTOCOL_OpenPGP);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_ctx;
+-    }
+-  e = gpgme_ctx_set_engine_info (ctx, GPGME_PROTOCOL_OpenPGP, GPG_PATH, NULL);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_ctx;
+-    }
+-  gpgme_set_pinentry_mode (ctx, GPGME_PINENTRY_MODE_LOOPBACK);
+-  gpgme_set_passphrase_cb (ctx, gpgme_passphrase_cb, (void *)passphrase);
+-  *res = ctx;
+-  return 0;
+-
+- err_ctx:
+-  gpgme_release (ctx);
+- err:
+-  return -1;
+-}
+-
+- /* LIBVK_PACKET_FORMAT_PASSPHRASE */
+-
+-/* Encrypt DATA of SIZE using PASSPHRASE.
+-   Return encrypted data (for g_free()), setting RES_SIZE to the size of the
+-   result, on success, NULL otherwise. */
+-void *
+-encrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
+-			 const char *passphrase, GError **error)
+-{
+-  gpgme_ctx_t ctx;
+-  gpgme_error_t e;
+-  gpgme_data_t src_data, dest_data;
+-  void *gpgme_res, *res;
+-
+-  // FIXME: this should eventually use CMS
+-  if (init_gpgme (&ctx, passphrase, error) != 0)
+-      goto err;
+-  e = gpgme_data_new_from_mem (&src_data, data, size, 0);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_ctx;
+-    }
+-  e = gpgme_data_new (&dest_data);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_src_data;
+-    }
+-  e = gpgme_op_encrypt (ctx, NULL, 0, src_data, dest_data);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_dest_data;
+-    }
+-  gpgme_data_release (src_data);
+-  gpgme_res = gpgme_data_release_and_get_mem (dest_data, res_size);
+-  if (gpgme_res == NULL)
+-    {
+-      g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO,
+-		   _("Unknown error getting encryption result"));
+-      goto err_ctx;
+-    }
+-  res = g_memdup (gpgme_res, *res_size);
+-  gpgme_free (gpgme_res);
+-
+-  gpgme_release (ctx);
+-  return res;
+-
+- err_dest_data:
+-  gpgme_data_release (src_data);
+- err_src_data:
+-  gpgme_data_release (dest_data);
+- err_ctx:
+-  gpgme_release (ctx);
+- err:
+-  return NULL;
+-}
+-
+-/* Decrypt DATA of SIZE using PASSPHRASE.
+-   Return decrypted data (for g_free()), setting RES_SIZE to the size of the
+-   result, on success, NULL otherwise. */
+-void *
+-decrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
+-			 const char *passphrase, GError **error)
+-{
+-  gpgme_ctx_t ctx;
+-  gpgme_error_t e;
+-  gpgme_data_t src_data, dest_data;
+-  void *gpgme_res, *res;
+-
+-  if (init_gpgme (&ctx, passphrase, error) != 0)
+-      goto err;
+-  e = gpgme_data_new_from_mem (&src_data, data, size, 0);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_ctx;
+-    }
+-  e = gpgme_data_new (&dest_data);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_src_data;
+-    }
+-  e = gpgme_op_decrypt (ctx, src_data, dest_data);
+-  if (e != GPG_ERR_NO_ERROR)
+-    {
+-      error_from_gpgme (error, e);
+-      goto err_dest_data;
+-    }
+-  gpgme_data_release (src_data);
+-  gpgme_res = gpgme_data_release_and_get_mem (dest_data, res_size);
+-  if (gpgme_res == NULL)
+-    {
+-      g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO,
+-		   _("Unknown error getting decryption result"));
+-      goto err_ctx;
+-    }
+-  res = g_memdup (gpgme_res, *res_size);
+-  gpgme_free (gpgme_res);
+-
+-  gpgme_release (ctx);
+-  return res;
+-
+- err_dest_data:
+-  gpgme_data_release (src_data);
+- err_src_data:
+-  gpgme_data_release (dest_data);
+- err_ctx:
+-  gpgme_release (ctx);
+- err:
+-  return NULL;
+-}
+diff -up volume_key-0.3.12/lib/crypto-gpgme.c.sq_crypto volume_key-0.3.12/lib/crypto-gpgme.c
+--- volume_key-0.3.12/lib/crypto-gpgme.c.sq_crypto	2025-07-23 13:35:56.132605020 +0200
++++ volume_key-0.3.12/lib/crypto-gpgme.c	2025-07-23 13:35:56.132605020 +0200
+@@ -0,0 +1,432 @@
++/* libgpgme utils */
++static void
++error_from_gpgme (GError **error, gpgme_error_t e)
++{
++    size_t len;
++    char *s;
++
++    s = NULL;
++    len = 100;
++    for (;;)
++    {
++        s = g_realloc (s, len);
++        if (gpgme_strerror_r (e, s, len) == 0)
++            break;
++        len *= 2;
++    }
++    g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO, _("%s: %s"),
++                gpgme_strsource (e), s);
++    g_free (s);
++}
++
++static gpgme_error_t
++gpgme_passphrase_cb (void *hook, const char *uid_hint,
++                    const char *passphrase_info, int prev_was_bad, int fd)
++{
++    static const char nl = '\n';
++
++    const char *pw;
++    size_t len;
++    ssize_t res;
++
++    (void)uid_hint;
++    (void)passphrase_info;
++    if (prev_was_bad != 0)
++        return GPG_ERR_CANCELED;
++    pw = hook;
++    len = strlen (pw);
++    while (len != 0)
++    {
++        res = write (fd, pw, len);
++        if (res < 0)
++            return gpgme_error_from_errno (errno);
++        pw += res;
++        len -= res;
++    }
++    if (write (fd, &nl, sizeof (nl)) < 0)
++        return gpgme_error_from_errno (errno);
++    return 0;
++}
++// Error helper (simplified from GPGME’s error_from_gpgme)
++
++
++/* Create and configure a gpgme context, to use PASSPHRASE.
++ *   Return 0 if OK, -1 on error. */
++static int
++init_gpgme (gpgme_ctx_t *res, const char *passphrase, GError **error)
++{
++    gpgme_ctx_t ctx;
++    gpgme_error_t e;
++
++    (void)gpgme_check_version (NULL);
++    e = gpgme_new (&ctx);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err;
++    }
++    e = gpgme_set_locale (ctx, LC_CTYPE, setlocale (LC_CTYPE, NULL));
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_set_locale (ctx, LC_MESSAGES, setlocale (LC_MESSAGES, NULL));
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_set_protocol (ctx, GPGME_PROTOCOL_OpenPGP);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_ctx_set_engine_info (ctx, GPGME_PROTOCOL_OpenPGP, GPG_PATH, NULL);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    gpgme_set_pinentry_mode (ctx, GPGME_PINENTRY_MODE_LOOPBACK);
++    gpgme_set_passphrase_cb (ctx, gpgme_passphrase_cb, (void *)passphrase);
++    *res = ctx;
++    return 0;
++
++    err_ctx:
++    gpgme_release (ctx);
++    err:
++    return -1;
++}
++
++/* LIBVK_PACKET_FORMAT_PASSPHRASE */
++
++/* Encrypt DATA of SIZE using PASSPHRASE.
++ *   Return encrypted data (for g_free()), setting RES_SIZE to the size of the
++ *   result, on success, NULL otherwise. */
++void *
++encrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
++                         const char *passphrase, GError **error)
++{
++    gpgme_ctx_t ctx;
++    gpgme_error_t e;
++    gpgme_data_t src_data, dest_data;
++    void *gpgme_res, *res;
++
++    // FIXME: this should eventually use CMS
++    if (init_gpgme (&ctx, passphrase, error) != 0)
++        goto err;
++    e = gpgme_data_new_from_mem (&src_data, data, size, 0);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_data_new (&dest_data);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_src_data;
++    }
++    e = gpgme_op_encrypt (ctx, NULL, 0, src_data, dest_data);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_dest_data;
++    }
++    gpgme_data_release (src_data);
++    gpgme_res = gpgme_data_release_and_get_mem (dest_data, res_size);
++    if (gpgme_res == NULL)
++    {
++        g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO,
++                     _("Unknown error getting encryption result"));
++        goto err_ctx;
++    }
++    res = g_memdup2 (gpgme_res, *res_size);
++    gpgme_free (gpgme_res);
++
++    gpgme_release (ctx);
++    return res;
++
++    err_dest_data:
++    gpgme_data_release (src_data);
++    err_src_data:
++    gpgme_data_release (dest_data);
++    err_ctx:
++    gpgme_release (ctx);
++    err:
++    return NULL;
++}
++
++/* Decrypt DATA of SIZE using PASSPHRASE.
++ *   Return decrypted data (for g_free()), setting RES_SIZE to the size of the
++ *   result, on success, NULL otherwise. */
++void *
++decrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
++                        const char *passphrase, GError **error)
++{
++    gpgme_ctx_t ctx;
++    gpgme_error_t e;
++    gpgme_data_t src_data, dest_data;
++    void *gpgme_res, *res;
++
++    if (init_gpgme (&ctx, passphrase, error) != 0)
++        goto err;
++    e = gpgme_data_new_from_mem (&src_data, data, size, 0);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_data_new (&dest_data);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_src_data;
++    }
++    e = gpgme_op_decrypt (ctx, src_data, dest_data);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_dest_data;
++    }
++    gpgme_data_release (src_data);
++    gpgme_res = gpgme_data_release_and_get_mem (dest_data, res_size);
++    if (gpgme_res == NULL)
++    {
++        g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO,
++                     _("Unknown error getting decryption result"));
++        goto err_ctx;
++    }
++    res = g_memdup2 (gpgme_res, *res_size);
++    gpgme_free (gpgme_res);
++
++    gpgme_release (ctx);
++    return res;
++
++    err_dest_data:
++    gpgme_data_release (src_data);
++    err_src_data:
++    gpgme_data_release (dest_data);
++    err_ctx:
++    gpgme_release (ctx);
++    err:
++    return NULL;
++}
++/* libgpgme utils */
++static void
++error_from_gpgme (GError **error, gpgme_error_t e)
++{
++    size_t len;
++    char *s;
++
++    s = NULL;
++    len = 100;
++    for (;;)
++    {
++        s = g_realloc (s, len);
++        if (gpgme_strerror_r (e, s, len) == 0)
++            break;
++        len *= 2;
++    }
++    g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO, _("%s: %s"),
++                gpgme_strsource (e), s);
++    g_free (s);
++}
++
++static gpgme_error_t
++gpgme_passphrase_cb (void *hook, const char *uid_hint,
++                    const char *passphrase_info, int prev_was_bad, int fd)
++{
++    static const char nl = '\n';
++
++    const char *pw;
++    size_t len;
++    ssize_t res;
++
++    (void)uid_hint;
++    (void)passphrase_info;
++    if (prev_was_bad != 0)
++        return GPG_ERR_CANCELED;
++    pw = hook;
++    len = strlen (pw);
++    while (len != 0)
++    {
++        res = write (fd, pw, len);
++        if (res < 0)
++            return gpgme_error_from_errno (errno);
++        pw += res;
++        len -= res;
++    }
++    if (write (fd, &nl, sizeof (nl)) < 0)
++        return gpgme_error_from_errno (errno);
++    return 0;
++}
++// Error helper (simplified from GPGME’s error_from_gpgme)
++
++
++/* Create and configure a gpgme context, to use PASSPHRASE.
++ *   Return 0 if OK, -1 on error. */
++static int
++init_gpgme (gpgme_ctx_t *res, const char *passphrase, GError **error)
++{
++    gpgme_ctx_t ctx;
++    gpgme_error_t e;
++
++    (void)gpgme_check_version (NULL);
++    e = gpgme_new (&ctx);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err;
++    }
++    e = gpgme_set_locale (ctx, LC_CTYPE, setlocale (LC_CTYPE, NULL));
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_set_locale (ctx, LC_MESSAGES, setlocale (LC_MESSAGES, NULL));
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_set_protocol (ctx, GPGME_PROTOCOL_OpenPGP);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_ctx_set_engine_info (ctx, GPGME_PROTOCOL_OpenPGP, GPG_PATH, NULL);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    gpgme_set_pinentry_mode (ctx, GPGME_PINENTRY_MODE_LOOPBACK);
++    gpgme_set_passphrase_cb (ctx, gpgme_passphrase_cb, (void *)passphrase);
++    *res = ctx;
++    return 0;
++
++    err_ctx:
++    gpgme_release (ctx);
++    err:
++    return -1;
++}
++
++/* LIBVK_PACKET_FORMAT_PASSPHRASE */
++
++/* Encrypt DATA of SIZE using PASSPHRASE.
++ *   Return encrypted data (for g_free()), setting RES_SIZE to the size of the
++ *   result, on success, NULL otherwise. */
++void *
++encrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
++                         const char *passphrase, GError **error)
++{
++    gpgme_ctx_t ctx;
++    gpgme_error_t e;
++    gpgme_data_t src_data, dest_data;
++    void *gpgme_res, *res;
++
++    // FIXME: this should eventually use CMS
++    if (init_gpgme (&ctx, passphrase, error) != 0)
++        goto err;
++    e = gpgme_data_new_from_mem (&src_data, data, size, 0);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_data_new (&dest_data);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_src_data;
++    }
++    e = gpgme_op_encrypt (ctx, NULL, 0, src_data, dest_data);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_dest_data;
++    }
++    gpgme_data_release (src_data);
++    gpgme_res = gpgme_data_release_and_get_mem (dest_data, res_size);
++    if (gpgme_res == NULL)
++    {
++        g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO,
++                     _("Unknown error getting encryption result"));
++        goto err_ctx;
++    }
++    res = g_memdup2 (gpgme_res, *res_size);
++    gpgme_free (gpgme_res);
++
++    gpgme_release (ctx);
++    return res;
++
++    err_dest_data:
++    gpgme_data_release (src_data);
++    err_src_data:
++    gpgme_data_release (dest_data);
++    err_ctx:
++    gpgme_release (ctx);
++    err:
++    return NULL;
++}
++
++/* Decrypt DATA of SIZE using PASSPHRASE.
++ *   Return decrypted data (for g_free()), setting RES_SIZE to the size of the
++ *   result, on success, NULL otherwise. */
++void *
++decrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
++                        const char *passphrase, GError **error)
++{
++    gpgme_ctx_t ctx;
++    gpgme_error_t e;
++    gpgme_data_t src_data, dest_data;
++    void *gpgme_res, *res;
++
++    if (init_gpgme (&ctx, passphrase, error) != 0)
++        goto err;
++    e = gpgme_data_new_from_mem (&src_data, data, size, 0);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_ctx;
++    }
++    e = gpgme_data_new (&dest_data);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_src_data;
++    }
++    e = gpgme_op_decrypt (ctx, src_data, dest_data);
++    if (e != GPG_ERR_NO_ERROR)
++    {
++        error_from_gpgme (error, e);
++        goto err_dest_data;
++    }
++    gpgme_data_release (src_data);
++    gpgme_res = gpgme_data_release_and_get_mem (dest_data, res_size);
++    if (gpgme_res == NULL)
++    {
++        g_set_error (error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO,
++                     _("Unknown error getting decryption result"));
++        goto err_ctx;
++    }
++    res = g_memdup2 (gpgme_res, *res_size);
++    gpgme_free (gpgme_res);
++
++    gpgme_release (ctx);
++    return res;
++
++    err_dest_data:
++    gpgme_data_release (src_data);
++    err_src_data:
++    gpgme_data_release (dest_data);
++    err_ctx:
++    gpgme_release (ctx);
++    err:
++    return NULL;
++}
+diff -up volume_key-0.3.12/lib/crypto-gpgme.h.sq_crypto volume_key-0.3.12/lib/crypto-gpgme.h
+--- volume_key-0.3.12/lib/crypto-gpgme.h.sq_crypto	2025-07-23 13:35:56.132749491 +0200
++++ volume_key-0.3.12/lib/crypto-gpgme.h	2025-07-23 13:35:56.132749491 +0200
+@@ -0,0 +1,16 @@
++#ifndef CRYPTO_GPGME_H
++#define CRYPTO_GPGME_H
++void *encrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
++                         const char *passphrase, GError **error);
++
++void *decrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
++                         const char *passphrase, GError **error);
++#endif
++#ifndef CRYPTO_GPGME_H
++#define CRYPTO_GPGME_H
++void *encrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
++                         const char *passphrase, GError **error);
++
++void *decrypt_with_passphrase (size_t *res_size, const void *data, size_t size,
++                         const char *passphrase, GError **error);
++#endif
+diff -up volume_key-0.3.12/lib/crypto-sq.c.sq_crypto volume_key-0.3.12/lib/crypto-sq.c
+--- volume_key-0.3.12/lib/crypto-sq.c.sq_crypto	2025-07-23 13:35:56.132872512 +0200
++++ volume_key-0.3.12/lib/crypto-sq.c	2025-07-23 13:35:56.132872512 +0200
+@@ -0,0 +1,382 @@
++#include <config.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/wait.h>
++#include <sys/stat.h>
++#include "crypto-sq.h"
++#include "libvolume_key.h"
++#include <glib.h>
++#include <glib/gi18n-lib.h>
++
++struct _sqme_ctx {
++    char *passphrase;
++};
++
++struct _sqme_data {
++    void *buf;
++    size_t size;
++    int owned;  // Whether we own the buffer (1) or not (0)
++};
++
++/* Error Handling */
++GQuark sqme_error_quark(void) {
++    return g_quark_from_static_string("sqme-error-quark");
++}
++
++void sqme_set_error(GError **error, sqme_error_t e, const char *msg) {
++    if (error) {
++        g_set_error(error, SQGPGME_ERROR, e, "%s", msg);
++    }
++}
++
++const char *sqme_strerror(sqme_error_t err) {
++    switch (err) {
++        case SQGPGME_ERR_NO_ERROR: return "No error";
++        case SQGPGME_ERR_GENERAL: return "General error";
++        case SQGPGME_ERR_ENOMEM: return "Out of memory";
++        case SQGPGME_ERR_CANCELED: return "Operation canceled";
++        case SQGPGME_ERR_BAD_PASSPHRASE: return "Bad passphrase";
++        case SQGPGME_ERR_SYSTEM: return "System error";
++        default: return "Unknown error";
++    }
++}
++
++/* Context Management */
++sqme_error_t sqme_new(sqme_ctx_t **ctx) {
++    *ctx = g_malloc0(sizeof(sqme_ctx_t));
++    if (!*ctx) return SQGPGME_ERR_ENOMEM;
++    return SQGPGME_ERR_NO_ERROR;
++}
++
++void sqme_release(sqme_ctx_t *ctx) {
++    if (!ctx) return;
++    g_free(ctx->passphrase);
++    g_free(ctx);
++}
++
++sqme_error_t sqme_set_passphrase(sqme_ctx_t *ctx, const char *passphrase) {
++    if (!ctx) return SQGPGME_ERR_GENERAL;
++    g_free(ctx->passphrase);
++    ctx->passphrase = g_strdup(passphrase);
++    return SQGPGME_ERR_NO_ERROR;
++}
++
++/* Data Management */
++sqme_error_t sqme_data_new_from_mem(sqme_data_t **data, const void *buf, size_t size, int copy) {
++    *data = g_malloc0(sizeof(sqme_data_t));
++    if (!*data) return SQGPGME_ERR_ENOMEM;
++    if (copy) {
++        (*data)->buf = g_memdup2(buf, size);
++        (*data)->owned = 1;
++    } else {
++        (*data)->buf = (void *)buf;
++        (*data)->owned = 0;
++    }
++    (*data)->size = size;
++    return SQGPGME_ERR_NO_ERROR;
++}
++
++sqme_error_t sqme_data_new(sqme_data_t **data) {
++    *data = g_malloc0(sizeof(sqme_data_t));
++    if (!*data) return SQGPGME_ERR_ENOMEM;
++    return SQGPGME_ERR_NO_ERROR;
++}
++
++void sqme_data_release(sqme_data_t *data) {
++    if (!data) return;
++    if (data->owned) g_free(data->buf);
++    g_free(data);
++}
++
++void *sqme_data_release_and_get_mem(sqme_data_t *data, size_t *size) {
++    if (!data) return NULL;
++    void *buf = data->buf;
++    *size = data->size;
++    data->buf = NULL;  // Prevent double free
++    sqme_data_release(data);
++    return buf;
++}
++
++/* Encryption/Decryption Helpers */
++static sqme_error_t run_sq(const char *passphrase, const char *cmd, const void *in, size_t in_size, void **out, size_t *out_size, GError **error) {
++    int in_pipe[2], out_pipe[2], err_pipe[2];
++    pid_t pid;
++    ssize_t total_read = 0;
++    char *out_buf = NULL;
++    size_t buf_size = 0;
++    char fifo_prefix[] = "/tmp/sqme_fifoXXXXXX";
++    char fifo_path[64]; // reserve some space for fifo_prefix and strcat later
++    int fifo_fd;
++
++    // Create named pipe (FIFO)
++    if (mkdtemp(fifo_prefix) == NULL) {
++        return SQGPGME_ERR_SYSTEM;
++    }
++    strcat(strcpy(fifo_path, fifo_prefix), "/fifo");
++    if (mkfifo(fifo_path, 0600) < 0) {
++        rmdir(fifo_prefix);
++        return SQGPGME_ERR_SYSTEM;
++    }
++
++    if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0 || pipe(err_pipe) < 0) {
++        unlink(fifo_path);
++        return SQGPGME_ERR_SYSTEM;
++    }
++
++    pid = fork();
++    if (pid < 0) {
++        close(in_pipe[0]); close(in_pipe[1]);
++        close(out_pipe[0]); close(out_pipe[1]);
++        close(err_pipe[0]); close(err_pipe[1]);
++        unlink(fifo_path);
++        rmdir(fifo_prefix);
++        return SQGPGME_ERR_SYSTEM;
++    }
++
++    if (pid == 0) {  // Child process
++        close(in_pipe[1]);
++        close(out_pipe[0]);
++        close(err_pipe[0]);
++
++        dup2(in_pipe[0], STDIN_FILENO);
++        dup2(out_pipe[1], STDOUT_FILENO);
++        dup2(err_pipe[1], STDERR_FILENO);
++
++        if (strcmp(cmd, "encrypt") == 0) {
++            execlp(SQ_PATH, SQ_PATH, "encrypt", "--with-password-file", fifo_path, "--without-signature", NULL);
++        } else if (strcmp(cmd, "decrypt") == 0) {
++            execlp(SQ_PATH, SQ_PATH, "decrypt", "--password-file", fifo_path, NULL);
++        }
++        if (errno == ENOENT)
++            _exit(127);
++        _exit(126);  // If exec fails
++    }
++
++    // Parent process
++    close(in_pipe[0]);
++    close(out_pipe[1]);
++    close(err_pipe[1]);
++
++    // Write passphrase to FIFO (non-blocking write in a separate fork to avoid blocking)
++    pid_t fifo_pid = fork();
++    if (fifo_pid < 0) {
++        close(in_pipe[1]);
++        close(out_pipe[0]);
++        close(err_pipe[0]);
++        waitpid(pid, NULL, 0);
++        unlink(fifo_path);
++        return SQGPGME_ERR_SYSTEM;
++    }
++    if (fifo_pid == 0) {
++        fifo_fd = open(fifo_path, O_WRONLY);  // Blocks until sq opens for reading
++        if (fifo_fd >= 0) {
++            write(fifo_fd, passphrase, strlen(passphrase));  // No \n
++            close(fifo_fd);
++        }
++        _exit(0);
++    }
++
++    // Write input data to in_pipe
++    size_t remaining = in_size;
++    const char *in_ptr = in;
++    while (remaining > 0) {
++        ssize_t written = write(in_pipe[1], in_ptr, remaining);
++        if (written < 0) {
++            close(in_pipe[1]);
++            close(out_pipe[0]);
++            close(err_pipe[0]);
++            waitpid(pid, NULL, 0);
++            waitpid(fifo_pid, NULL, 0);
++            unlink(fifo_path);
++            rmdir(fifo_prefix);
++            return SQGPGME_ERR_SYSTEM;
++        }
++        in_ptr += written;
++        remaining -= written;
++    }
++    close(in_pipe[1]);
++
++    // Read output from out_pipe
++    char buffer[4096];
++    while (1) {
++        ssize_t n = read(out_pipe[0], buffer, sizeof(buffer));
++        if (n <= 0) break;  // EOF or error
++        if (total_read + n > buf_size) {
++            buf_size = total_read + n + 4096;  // Grow buffer with padding
++            out_buf = g_realloc(out_buf, buf_size);
++        }
++        memcpy(out_buf + total_read, buffer, n);
++        total_read += n;
++    }
++    close(out_pipe[0]);
++
++    // Read stderr for error messages
++    char err_buf[1024];
++    ssize_t err_len = read(err_pipe[0], err_buf, sizeof(err_buf) - 1);
++    close(err_pipe[0]);
++    if (err_len > 0) {
++        err_buf[err_len] = '\0';
++    }
++
++    int status;
++    waitpid(pid, &status, 0);
++
++    int exit_code = 0;
++    if (WIFEXITED(status) && ((exit_code=WEXITSTATUS(status)) !=0)) {
++        // exit_code = WEXITSTATUS(status);
++        kill(fifo_pid, SIGTERM); // Terminate second child if still running
++        g_free(out_buf);
++        if (err_len > 0) {
++            sqme_set_error(error, SQGPGME_ERR_BAD_PASSPHRASE, err_buf);
++        } else if (exit_code == 126) {
++            sqme_set_error(error, SQGPGME_ERR_SYSTEM, "Execution of 'sq' failed");
++        } else if (exit_code == 127) {
++            sqme_set_error(error, SQGPGME_ERR_SYSTEM, "sq executable not found");
++        } else {
++            sqme_set_error(error, SQGPGME_ERR_BAD_PASSPHRASE, "Command failed, possibly bad passphrase");
++        }
++    }
++    waitpid(fifo_pid, NULL, 0);  // Clean up FIFO writer
++    rmdir(fifo_prefix);
++    unlink(fifo_path);  // Remove FIFO
++
++    if (exit_code) {
++        return SQGPGME_ERR_BAD_PASSPHRASE;
++    }
++
++    *out = out_buf;
++    *out_size = total_read;
++    return SQGPGME_ERR_NO_ERROR;
++}
++
++sqme_error_t sqme_op_encrypt(sqme_ctx_t *ctx, sqme_data_t *in, sqme_data_t *out, GError **error) {
++    if (!ctx || !in || !out || !ctx->passphrase) return SQGPGME_ERR_GENERAL;
++    void *out_buf;
++    size_t out_size;
++    sqme_error_t err = run_sq(ctx->passphrase, "encrypt", in->buf, in->size, &out_buf, &out_size, error);
++    if (err == SQGPGME_ERR_NO_ERROR) {
++        out->buf = out_buf;
++        out->size = out_size;
++        out->owned = 1;
++    }
++    return err;
++}
++
++sqme_error_t sqme_op_decrypt(sqme_ctx_t *ctx, sqme_data_t *in, sqme_data_t *out, GError **error) {
++    if (!ctx || !in || !out || !ctx->passphrase) return SQGPGME_ERR_GENERAL;
++    void *out_buf;
++    size_t out_size;
++    sqme_error_t err = run_sq(ctx->passphrase, "decrypt", in->buf, in->size, &out_buf, &out_size, error);
++    if (err == SQGPGME_ERR_NO_ERROR) {
++        out->buf = out_buf;
++        out->size = out_size;
++        out->owned = 1;
++    }
++    return err;
++}
++
++void *
++encrypt_with_passphrase(size_t *res_size, const void *data, size_t size,
++                        const char *passphrase, GError **error)
++{
++    sqme_ctx_t *ctx;
++    sqme_data_t *src_data, *dest_data;
++    void *res;
++
++    if (sqme_new(&ctx) != SQGPGME_ERR_NO_ERROR) {
++        sqme_set_error(error, SQGPGME_ERR_ENOMEM, "Failed to create context");
++        goto err;
++    }
++    if (sqme_set_passphrase(ctx, passphrase) != SQGPGME_ERR_NO_ERROR) {
++        sqme_set_error(error, SQGPGME_ERR_GENERAL, "Failed to set passphrase");
++        goto err_ctx;
++    }
++    if (sqme_data_new_from_mem(&src_data, data, size, 0) != SQGPGME_ERR_NO_ERROR) {
++        sqme_set_error(error, SQGPGME_ERR_ENOMEM, "Failed to create source data");
++        goto err_ctx;
++    }
++    if (sqme_data_new(&dest_data) != SQGPGME_ERR_NO_ERROR) {
++        sqme_set_error(error, SQGPGME_ERR_ENOMEM, "Failed to create destination data");
++        goto err_src_data;
++    }
++    if (sqme_op_encrypt(ctx, src_data, dest_data, error) != SQGPGME_ERR_NO_ERROR) {
++        if (!*error)
++            sqme_set_error(error, SQGPGME_ERR_BAD_PASSPHRASE, "Encryption failed, possibly bad passphrase");
++        goto err_dest_data;
++    }
++
++    sqme_data_release(src_data);
++    res = sqme_data_release_and_get_mem(dest_data, res_size);
++    if (!res) {
++        g_set_error(error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO, _("Unknown error getting encryption result"));
++        goto err_ctx;
++    }
++    sqme_release(ctx);
++    return res;
++
++    err_dest_data:
++    sqme_data_release(dest_data);
++    err_src_data:
++    sqme_data_release(src_data);
++    err_ctx:
++    sqme_release(ctx);
++    err:
++    return NULL;
++}
++
++
++/* Decrypt DATA of SIZE using PASSPHRASE.
++ *   Return decrypted data (for g_free()), setting RES_SIZE to the size of the
++ *   result, on success, NULL otherwise. */
++void *
++decrypt_with_passphrase(size_t *res_size, const void *data, size_t size,
++                        const char *passphrase, GError **error)
++{
++    sqme_ctx_t *ctx;
++    sqme_data_t *src_data, *dest_data;
++    void *res;
++
++    if (sqme_new(&ctx) != SQGPGME_ERR_NO_ERROR) {
++        sqme_set_error(error, SQGPGME_ERR_ENOMEM, "Failed to create context");
++        goto err;
++    }
++    if (sqme_set_passphrase(ctx, passphrase) != SQGPGME_ERR_NO_ERROR) {
++        sqme_set_error(error, SQGPGME_ERR_GENERAL, "Failed to set passphrase");
++        goto err_ctx;
++    }
++    if (sqme_data_new_from_mem(&src_data, data, size, 0) != SQGPGME_ERR_NO_ERROR) {
++        sqme_set_error(error, SQGPGME_ERR_ENOMEM, "Failed to create source data");
++        goto err_ctx;
++    }
++    if (sqme_data_new(&dest_data) != SQGPGME_ERR_NO_ERROR) {
++        sqme_set_error(error, SQGPGME_ERR_ENOMEM, "Failed to create destination data");
++        goto err_src_data;
++    }
++    if (sqme_op_decrypt(ctx, src_data, dest_data, error) != SQGPGME_ERR_NO_ERROR) {
++        if (!*error)
++            sqme_set_error(error, SQGPGME_ERR_BAD_PASSPHRASE, "Decryption failed, possibly bad passphrase");
++        goto err_dest_data;
++    }
++
++    sqme_data_release(src_data);
++    res = sqme_data_release_and_get_mem(dest_data, res_size);
++    if (!res) {
++        g_set_error(error, LIBVK_ERROR, LIBVK_ERROR_CRYPTO, _("Unknown error getting encryption result"));
++        goto err_ctx;
++    }
++    sqme_release(ctx);
++    return res;
++
++    err_dest_data:
++    sqme_data_release(dest_data);
++    err_src_data:
++    sqme_data_release(src_data);
++    err_ctx:
++    sqme_release(ctx);
++    err:
++    return NULL;
++}
+diff -up volume_key-0.3.12/lib/crypto-sq.h.sq_crypto volume_key-0.3.12/lib/crypto-sq.h
+--- volume_key-0.3.12/lib/crypto-sq.h.sq_crypto	2025-07-23 13:35:56.132993038 +0200
++++ volume_key-0.3.12/lib/crypto-sq.h	2025-07-23 13:35:56.132993038 +0200
+@@ -0,0 +1,45 @@
++#ifndef SQME_H
++#define SQME_H
++
++#include <stddef.h>
++#include <glib.h>
++
++typedef enum {
++    SQGPGME_ERR_NO_ERROR = 0,
++    SQGPGME_ERR_GENERAL = 1,
++    SQGPGME_ERR_ENOMEM = 2,
++    SQGPGME_ERR_CANCELED = 3,
++    SQGPGME_ERR_BAD_PASSPHRASE = 4,
++    SQGPGME_ERR_SYSTEM = 5
++} sqme_error_t;
++
++typedef struct _sqme_ctx sqme_ctx_t;
++typedef struct _sqme_data sqme_data_t;
++
++// Error domain for sqme
++GQuark sqme_error_quark(void);
++#define SQGPGME_ERROR (sqme_error_quark())
++
++sqme_error_t sqme_new(sqme_ctx_t **ctx);
++void sqme_release(sqme_ctx_t *ctx);
++sqme_error_t sqme_set_passphrase(sqme_ctx_t *ctx, const char *passphrase);
++
++sqme_error_t sqme_data_new_from_mem(sqme_data_t **data, const void *buf, size_t size, int copy);
++sqme_error_t sqme_data_new(sqme_data_t **data);
++void sqme_data_release(sqme_data_t *data);
++void *sqme_data_release_and_get_mem(sqme_data_t *data, size_t *size);
++
++sqme_error_t sqme_op_encrypt(sqme_ctx_t *ctx, sqme_data_t *in, sqme_data_t *out, GError **error);
++sqme_error_t sqme_op_decrypt(sqme_ctx_t *ctx, sqme_data_t *in, sqme_data_t *out, GError **error);
++
++const char *sqme_strerror(sqme_error_t err);
++void sqme_set_error(GError **error, sqme_error_t e, const char *msg);
++
++void *encrypt_with_passphrase(size_t *res_size, const void *data, size_t size,
++                        const char *passphrase, GError **error);
++
++void *decrypt_with_passphrase(size_t *res_size, const void *data, size_t size,
++                        const char *passphrase, GError **error);
++
++#endif /* SQME_H */
++
+diff -up volume_key-0.3.12/lib/Makefile.am.sq_crypto volume_key-0.3.12/lib/Makefile.am
+--- volume_key-0.3.12/lib/Makefile.am.sq_crypto	2018-09-18 16:08:04.000000000 +0200
++++ volume_key-0.3.12/lib/Makefile.am	2025-07-23 13:35:56.133161093 +0200
+@@ -33,6 +33,12 @@ libvolume_key_la_SOURCES = SECerrs.h SSL
+ 	ui.c ui.h \
+ 	volume.c volume.h \
+ 	volume_luks.c volume_luks.h
++if WITH_SQ
++libvolume_key_la_SOURCES += crypto-sq.c crypto-sq.h
++else
++libvolume_key_la_SOURCES += crypto-gpgme.c crypto-gpgme.h
++endif
++
+ libvolume_key_la_CPPFLAGS = $(AM_CPPFLAGS) $(LOCALEDIR_CPPFLAGS)
+ libvolume_key_la_LDFLAGS = -version-info $(VERSION_INFO)
+ libvolume_key_la_LIBADD = $(blkid_LIBS) $(glib_LIBS) $(GPGME_LIBS) \
+diff -up volume_key-0.3.12/m4/sq.m4.sq_crypto volume_key-0.3.12/m4/sq.m4
+--- volume_key-0.3.12/m4/sq.m4.sq_crypto	2025-07-23 13:35:56.133352712 +0200
++++ volume_key-0.3.12/m4/sq.m4	2025-07-23 14:08:01.349773347 +0200
+@@ -0,0 +1,34 @@
++AC_DEFUN([AM_CHECK_SQ],
++[
++  AC_ARG_WITH([sq],
++    [AS_HELP_STRING([--with-sq=PATH],
++      [specify the path to the Sequoia 'sq' binary])],
++    [sq_path="$withval"],
++    [sq_path=""])
++
++
++  SQ_PATH=""
++  if test "x$sq_path" != "x" -a "x$sq_path" != "xyes"; then
++  AC_MSG_CHECKING([for Sequoia sq])
++    if test -x "$sq_path"; then
++      SQ_PATH="$sq_path"
++      AC_MSG_RESULT([found at $sq_path])
++    elif test "x$sq_path" != "xno"; then
++      AC_MSG_ERROR([specified sq binary at $sq_path is not executable])
++    fi
++  else
++    # Search for sq in PATH
++    AC_PATH_PROG([SQ_PATH], [sq])
++
++    if test "x$SQ_PATH" = "x" -a "x$sq_path" != "x" -a "x$sq_path" != "xno"; then
++      AC_MSG_ERROR([Sequoia sq binary not found in PATH])
++    fi
++  fi
++
++  # Define variables only if sq is found
++  if test "x$SQ_PATH" != "x"; then
++    AC_SUBST([SQ_PATH])
++    AC_DEFINE_UNQUOTED([SQ_PATH], ["$SQ_PATH"], [Path to Sequoia sq binary])
++    AC_DEFINE([WITH_SQ], [1], [Define to 1 if Sequoia sq binary is available])
++  fi
++])

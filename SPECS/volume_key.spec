@@ -32,7 +32,7 @@
 Summary: An utility for manipulating storage encryption keys and passphrases
 Name: volume_key
 Version: 0.3.12
-Release: 24%{?dist}
+Release: 25%{?dist}
 License: GPL-2.0-only AND (MPL-1.1 OR GPL-2.0-or-later OR LGPL-2.1-or-later)
 URL: https://pagure.io/%{name}/
 Requires: %{name}-libs%{?_isa} = %{version}-%{release}
@@ -45,11 +45,12 @@ Patch0: volume_key-0.3.12-support_LUKS2_and_more.patch
 # - backport of bf6618ec0b09b4e51fc97fa021e687fbd87599ba
 Patch1: volume_key-0.3.12-fix_resource_leaks.patch
 Patch2: volume_key-0.3.12-FIPS.patch
+Patch3: volume_key-0.3.12-sq_crypto.patch
 BuildRequires: autoconf, automake, libtool
 BuildRequires: make
 BuildRequires: gcc
 BuildRequires: cryptsetup-devel, gettext-devel, glib2-devel, /usr/bin/gpg2
-BuildRequires: gpgme-devel, libblkid-devel, nss-devel
+BuildRequires: libblkid-devel, nss-devel, sequoia-sq
 BuildRequires: python3-devel, python3-setuptools
 %if 0%{?drop_python2} < 1
 BuildRequires: python2-devel
@@ -94,7 +95,7 @@ Requires: %{name}-libs%{?_isa} = %{version}-%{release}
 
 %package libs
 Summary: A library for manipulating storage encryption keys and passphrases
-Requires: /usr/bin/gpg2
+Requires: sequoia-sq
 
 %description libs
 %{desc_lib}
@@ -121,13 +122,14 @@ Requires: %{name}-libs%{?_isa} = %{version}-%{release}
 
 %prep
 %setup -q
-%patch0 -p1
-%patch1 -p1
-%patch2 -p1
+%patch -P 0 -p1
+%patch -P 1 -p1
+%patch -P 2 -p1
+%patch -P 3 -p1 -b .sq_crypto
 autoreconf -fiv
 
 %build
-%configure %{?with_pythons}
+%configure %{?with_pythons} --with-sq
 %make_build
 
 %install
@@ -175,6 +177,9 @@ exit 1; \
 %endif
 
 %changelog
+* Wed Jul 23 2025 Michal Hlavinka <mhlavink@redhat.com> - 0.3.12-25
+- use sequoia instead of gpgme (RHEL-56368)
+
 * Wed Jan 15 2025 Vojtech Trefny <vtrefny@redhat.com> - 0.3.12-24
 - Make volume_key FIPS compliant
   Resolves: RHEL-74047
