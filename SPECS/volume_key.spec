@@ -32,7 +32,7 @@
 Summary: An utility for manipulating storage encryption keys and passphrases
 Name: volume_key
 Version: 0.3.12
-Release: 16%{?dist}
+Release: 17%{?dist}
 License: GPLv2
 URL: https://pagure.io/%{name}/
 Requires: %{name}-libs%{?_isa} = %{version}-%{release}
@@ -45,6 +45,8 @@ Patch0: volume_key-0.3.12-support_LUKS2_and_more.patch
 # - backport of bf6618ec0b09b4e51fc97fa021e687fbd87599ba
 Patch1: volume_key-0.3.12-fix_resource_leaks.patch
 Patch2:  volume_key-0.3.12-FIPS.patch
+# fix getting backup password from secret the FIPS way, RHEL-113757
+Patch3:  volume_key-0.3.12-fips2.patch
 BuildRequires: make
 BuildRequires: gcc
 BuildRequires: cryptsetup-devel, gettext-devel, glib2-devel, /usr/bin/gpg2
@@ -122,6 +124,7 @@ Requires: %{name}-libs%{?_isa} = %{version}-%{release}
 %patch -P 0 -p1
 %patch -P 1 -p1
 %patch -P 2 -p1 -b .FIPS
+%patch -P 3 -p1 -b .fips2
 
 %build
 %configure %{?with_pythons}
@@ -172,6 +175,9 @@ exit 1; \
 %endif
 
 %changelog
+* Thu Feb 12 2026 Michal Hlavinka <mhlavink@redhat.com> - 0.3.12-17
+- ake getting password from backed up secret FIPS compatible (RHEL-113757)
+
 * Thu Feb 06 2025 Michal Hlavinka <mhlavink@redhat.com> - 0.3.12-16
 - make volume_key FIPS compliant (RHEL-78044)
 
