@@ -32,7 +32,7 @@
 Summary: An utility for manipulating storage encryption keys and passphrases
 Name: volume_key
 Version: 0.3.12
-Release: 25%{?dist}
+Release: 26%{?dist}
 License: GPL-2.0-only AND (MPL-1.1 OR GPL-2.0-or-later OR LGPL-2.1-or-later)
 URL: https://pagure.io/%{name}/
 Requires: %{name}-libs%{?_isa} = %{version}-%{release}
@@ -46,6 +46,8 @@ Patch0: volume_key-0.3.12-support_LUKS2_and_more.patch
 Patch1: volume_key-0.3.12-fix_resource_leaks.patch
 Patch2: volume_key-0.3.12-FIPS.patch
 Patch3: volume_key-0.3.12-sq_crypto.patch
+# fix getting backup password from secret the FIPS way, RHEL-146218
+Patch4: volume_key-0.3.12-fips2.patch
 BuildRequires: autoconf, automake, libtool
 BuildRequires: make
 BuildRequires: gcc
@@ -126,6 +128,7 @@ Requires: %{name}-libs%{?_isa} = %{version}-%{release}
 %patch -P 1 -p1
 %patch -P 2 -p1
 %patch -P 3 -p1 -b .sq_crypto
+%patch -P 4 -p1 -b .fips2
 autoreconf -fiv
 
 %build
@@ -177,6 +180,9 @@ exit 1; \
 %endif
 
 %changelog
+* Wed Feb 11 2026 Michal Hlavinka <mhlavink@redhat.com> - 0.3.12-26
+- make getting password from backed up secret FIPS compatible (RHEL-146218)
+
 * Wed Jul 23 2025 Michal Hlavinka <mhlavink@redhat.com> - 0.3.12-25
 - use sequoia instead of gpgme (RHEL-56368)
 
